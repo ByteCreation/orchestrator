@@ -1,0 +1,17 @@
+[Unit]
+Description=model orchestrator
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do nvidia-smi -i 0 >/dev/null 2>&1 && nvidia-smi -i 1 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+ExecStart=/opt/orchestrator/venv/bin/python /opt/orchestrator/orchestrator.py
+Restart=always
+RestartSec=5
+User=orchestrator
+Group=orchestrator
+Environment="ORCHESTRATOR_DATA_DIR=/var/lib/orchestrator"
+
+[Install]
+WantedBy=multi-user.target

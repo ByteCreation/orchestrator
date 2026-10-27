@@ -1,0 +1,20 @@
+# Example drop-in: copy to /etc/systemd/system/orchestrator.service.d/override.conf
+# then: systemctl daemon-reload && systemctl restart orchestrator
+
+[Service]
+# Memory cap — set to ~90% of installed RAM (example below: 128 GB machine)
+MemoryMax=118111600640
+# Required for pinned staging buffers on large model loads
+LimitMEMLOCK=infinity
+
+# llama.cpp / CUDA knobs used by the reference deployment
+Environment="GGML_CUDA_CUBLAS_COMPUTE_TYPE=fp32"
+Environment="ORCHESTRATOR_HEALTH_LENIENT=1"
+
+# Strata backend (only when registry entries use backend=strata)
+Environment="STRATA_DATA_DIR=/var/lib/orchestrator/strata"
+Environment="CUDA_HOME=/usr/local/cuda"
+
+# Optional: bundle paths
+# Environment="ORCHESTRATOR_CUDA_RT=/opt/llama-cpp-rt"
+# Environment="ORCHESTRATOR_WARM_CACHE_SCRIPT=/var/lib/orchestrator/strata-warm-cache.py"
