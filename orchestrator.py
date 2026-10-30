@@ -57,6 +57,17 @@ HEALTH_START_TIMEOUT = 300
 VRAM_POLL_INTERVAL = 2
 GRACEFUL_SHUTDOWN_SECONDS = 30
 
+# Routing: number of in-flight/queued requests for a model on already-loaded
+# slots before we swap an idle slot to that model. 2 means a single request
+# will batch onto the existing slot; the second concurrent request triggers
+# a swap so both GPUs stay busy. Increase to be more conservative.
+SWAP_CONGESTION_THRESHOLD = int(os.environ.get("ORCHESTRATOR_SWAP_CONGESTION_THRESHOLD", "2"))
+
+# After a slot becomes idle with a non-default-boot model, swap it back to
+# its boot default if no new request arrives within this many seconds. This
+# prevents a single other-model request from permanently evicting a GPU.
+IDLE_SWAPBACK_SECONDS = float(os.environ.get("ORCHESTRATOR_IDLE_SWAPBACK_SECONDS", "300"))
+
 # Image-gen cooperation: node-mode.state records the current node
 # mode here. While an image/music-gen job owns a GPU, do not queue model
 # swaps against it; fail fast with an explanatory 503 (token
@@ -145,12 +156,17 @@ class Slot:
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ready_event: asyncio.Event = field(default_factory=asyncio.Event)
+    idle_since: Optional[float] = None
+    swapback_task: Optional[asyncio.Task] = None
 
     def url(self, path: str = "") -> str:
         return f"http://127.0.0.1:{self.port}{path}"
 
     def is_operational(self) -> bool:
         return self.state in ("init", "ready", "loading")
+
+    def is_idle(self) -> bool:
+        return self.state == "ready" and self.active_requests == 0 and self.queue.qsize() == 0
 
 
 # -----------------------------------------------------------------------------
@@ -398,6 +414,66 @@ class Orchestrator:
         self._tasks: set = set()
         self._route_counter = 0
         self._route_lock = asyncio.Lock()
+
+    # --- Slot idle / swap-back helpers ---
+
+    def _cancel_swapback(self, slot: Slot) -> None:
+        """Cancel any pending idle swap-back task for this slot."""
+        if slot.swapback_task and not slot.swapback_task.done():
+            slot.swapback_task.cancel()
+            slot.swapback_task = None
+
+    def _release_request(self, slot: Slot) -> None:
+        """Decrement active_requests and schedule swap-back if the slot is now idle."""
+        slot.active_requests = max(0, slot.active_requests - 1)
+        if slot.is_idle():
+            self._schedule_swapback(slot)
+        else:
+            # Slot is still busy; any pending swap-back must wait.
+            self._cancel_swapback(slot)
+
+    def _default_boot_model_for_slot(self, slot: Slot) -> Optional[str]:
+        defaults = self.registry.default_boot
+        if not defaults:
+            return None
+        if slot.index < len(defaults):
+            return defaults[slot.index]
+        return defaults[0]
+
+    def _schedule_swapback(self, slot: Slot) -> None:
+        """Schedule a swap back to the slot's boot-default model after idle timeout."""
+        self._cancel_swapback(slot)
+        default_model = self._default_boot_model_for_slot(slot)
+        if not default_model or slot.loaded_model == default_model:
+            return
+        slot.idle_since = time.time()
+
+        async def swapback_after_timeout():
+            await asyncio.sleep(IDLE_SWAPBACK_SECONDS)
+            # Recheck under the slot lock to avoid racing with a new request.
+            async with slot.lock:
+                if slot.is_idle() and slot.loaded_model != default_model:
+                    logger.info(
+                        "Slot %d idle for %.0fs; swapping back to boot default %s",
+                        slot.index, IDLE_SWAPBACK_SECONDS, default_model,
+                    )
+                    slot.active_requests += 1
+                    slot.state = "loading"
+                    slot.loaded_model = None
+                    # Run the actual load outside the lock; _start_model will reacquire it.
+                    asyncio.create_task(self._finish_swapback(slot, default_model))
+
+        slot.swapback_task = asyncio.create_task(swapback_after_timeout())
+
+    async def _finish_swapback(self, slot: Slot, model_id: str) -> None:
+        ok = await self._start_model(slot, model_id)
+        if not ok:
+            self._release_request(slot)
+            logger.error("Swap-back of %s to slot %d failed", model_id, slot.index)
+        else:
+            # The swap-back reservation is not tied to a real request; release it
+            # so the slot is available for routing again.
+            self._release_request(slot)
 
     # --- llama-server process management ---
 
@@ -668,6 +744,7 @@ class Orchestrator:
                     meta = self.registry.get(s.loaded_model)
                     if meta and meta.get("wide_slot"):
                         if s.loaded_model == model_id:
+                            self._cancel_swapback(s)
                             s.active_requests += 1
                             logger.info("Routing %s to wide slot %d (already loaded)", model_id, s.index)
                             return s
@@ -693,6 +770,7 @@ class Orchestrator:
             ]
             if free_matching:
                 chosen = self._round_robin_pick(free_matching)
+                self._cancel_swapback(chosen)
                 chosen.active_requests += 1
                 logger.info(
                     "Routing %s to free already-loaded slot %d (GPU %d)",
@@ -708,6 +786,7 @@ class Orchestrator:
             ]
             if loading_matching:
                 chosen = min(loading_matching, key=lambda s: (s.active_requests, s.index))
+                self._cancel_swapback(chosen)
                 chosen.active_requests += 1
                 wait_event = chosen.ready_event
                 logger.info(
@@ -717,22 +796,24 @@ class Orchestrator:
                 # fall through to await the slot outside the lock.
 
             # 2. Free idle slot with a different model (or empty) -> swap to target.
-            #    Congestion gate: if a ready slot already hosts this model but is
-            #    only momentarily busy (empty queue, <2 active), do NOT swap --
-            #    fall through to step 3 and continuous-batch onto it. A swap costs
-            #    a full model reload (~1 min) and loses to queueing unless the
-            #    matching slot is genuinely congested (e.g. simultaneous burst).
+            #    Congestion gate: batch up to SWAP_CONGESTION_THRESHOLD requests
+            #    onto the already-loaded slot before paying the cost of a swap.
+            #    This prevents churning GPUs for a single stray request while still
+            #    ensuring both GPUs are used under real load.
             elif chosen is None:
                 ready_matching = [
                     s for s in candidates
                     if s.state == "ready" and s.loaded_model == model_id
                 ]
+                matching_load = sum(s.active_requests for s in ready_matching)
+                queued_for_model = sum(
+                    1 for s in self.slots
+                    for m, _ in list(s.queue._queue)
+                    if m == model_id
+                )
                 allow_swap = (
                     not ready_matching
-                    or any(
-                        s.queue.qsize() >= 1 or s.active_requests >= 2
-                        for s in ready_matching
-                    )
+                    or (matching_load + queued_for_model) >= SWAP_CONGESTION_THRESHOLD
                 )
                 free_other = [
                     s for s in candidates
@@ -744,13 +825,15 @@ class Orchestrator:
                     chosen = self._round_robin_pick(free_other)
                     # Reserve the slot while the swap runs so another request does
                     # not grab it.
+                    self._cancel_swapback(chosen)
                     chosen.active_requests += 1
                     chosen.state = "loading"
                     chosen.loaded_model = None
                     swap = True
                     logger.info(
-                        "Swapping idle slot %d (GPU %d) to %s",
+                        "Swapping idle slot %d (GPU %d) to %s (threshold=%d, matching_load=%d, queued=%d)",
                         chosen.index, chosen.gpu, model_id,
+                        SWAP_CONGESTION_THRESHOLD, matching_load, queued_for_model,
                     )
                     # fall through to perform the swap outside the lock.
 
@@ -763,6 +846,7 @@ class Orchestrator:
                 ]
                 if busy_matching:
                     chosen = min(busy_matching, key=lambda s: (s.active_requests, s.index))
+                    self._cancel_swapback(chosen)
                     chosen.active_requests += 1
                     logger.info(
                         "Routing %s to busy already-loaded slot %d (GPU %d, active=%d)",
@@ -786,7 +870,7 @@ class Orchestrator:
             try:
                 await asyncio.wait_for(wait_event.wait(), timeout=self.queue_timeout)
             except asyncio.TimeoutError:
-                chosen.active_requests = max(0, chosen.active_requests - 1)
+                self._release_request(chosen)
                 raise HTTPException(
                     status_code=503,
                     detail=(
@@ -795,7 +879,7 @@ class Orchestrator:
                     ),
                 )
             if chosen.loaded_model != model_id or chosen.state != "ready":
-                chosen.active_requests = max(0, chosen.active_requests - 1)
+                self._release_request(chosen)
                 raise HTTPException(
                     status_code=503,
                     detail=f"Slot {chosen.index} failed to load '{model_id}'",
@@ -807,7 +891,7 @@ class Orchestrator:
         if swap:
             ok = await self._start_model(chosen, model_id)
             if not ok:
-                chosen.active_requests = max(0, chosen.active_requests - 1)
+                self._release_request(chosen)
                 raise HTTPException(
                     status_code=503,
                     detail=f"Failed to load '{model_id}' on slot {chosen.index}",
@@ -854,14 +938,19 @@ class Orchestrator:
                 event.set()
                 continue
             # Reserve the slot for the request that queued the swap, then load.
+            self._cancel_swapback(slot)
             slot.active_requests += 1
             slot.state = "loading"
             slot.loaded_model = None
             ok = await self._start_model(slot, model_id)
             if not ok:
                 logger.error("Queued swap of %s on slot %d failed", model_id, slot.index)
-                slot.active_requests = max(0, slot.active_requests - 1)
+                self._release_request(slot)
                 # _start_model leaves the slot in 'init' after killing the failed process.
+            else:
+                # Swap succeeded. The slot is reserved for the queued request
+                # (active_requests == 1), so cancel any swap-back timer.
+                self._cancel_swapback(slot)
             event.set()
 
     async def start_workers(self) -> None:
@@ -896,7 +985,7 @@ class Orchestrator:
             # child crashed, port not yet listening). Decrement the active request
             # counter so the slot isn't considered permanently busy, then return
             # 503 so the client retries on a healthy slot.
-            slot.active_requests = max(0, slot.active_requests - 1)
+            self._release_request(slot)
             elapsed = time.time() - start
             logger.warning(
                 "Upstream connect error on slot %d (%s) after %.3fs (active=%d): %s",
@@ -935,7 +1024,7 @@ class Orchestrator:
             if resp.status_code >= 400:
                 error_body = await resp.aread()
                 await resp.aclose()
-                slot.active_requests -= 1
+                self._release_request(slot)
                 elapsed = time.time() - start
                 logger.info(
                     "Streaming request to slot %d failed in %.3fs (status=%d, active=%d)",
@@ -957,7 +1046,7 @@ class Orchestrator:
                     logger.warning("Streaming request to slot %d aborted: %s", slot.index, e)
                 finally:
                     await resp.aclose()
-                    slot.active_requests -= 1
+                    self._release_request(slot)
                     elapsed = time.time() - start
                     logger.info("Streaming request to slot %d completed in %.3fs (active=%d)", slot.index, elapsed, slot.active_requests)
             return StreamingResponse(stream_response(), media_type="text/plain")
@@ -972,7 +1061,7 @@ class Orchestrator:
                     headers={k: v for k, v in resp.headers.items() if k.lower() not in ("content-encoding", "transfer-encoding")},
                 )
             finally:
-                slot.active_requests -= 1
+                self._release_request(slot)
                 elapsed = time.time() - start
                 logger.info("Request to slot %d completed in %.3fs (active=%d)", slot.index, elapsed, slot.active_requests)
 
@@ -1129,6 +1218,7 @@ class Orchestrator:
             raise HTTPException(status_code=404, detail=f"Slot {slot_index} does not exist")
         slot = self.slots[slot_index]
         async with slot.lock:
+            self._cancel_swapback(slot)
             await self._kill_slot(slot)
             await wait_for_vram_drain(slot.gpu, timeout=VRAM_DRAIN_TIMEOUT)
             slot.state = "stopped"
@@ -1141,6 +1231,7 @@ class Orchestrator:
             raise HTTPException(status_code=404, detail=f"Slot {slot_index} does not exist")
         self.registry.refresh()
         slot = self.slots[slot_index]
+        self._cancel_swapback(slot)
         defaults = self.registry.default_boot
         if len(defaults) <= slot_index:
             default_model = defaults[0] if defaults else None
@@ -1177,6 +1268,9 @@ class Orchestrator:
         for t in list(self._tasks):
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        # Cancel any pending idle swap-back tasks before killing slots.
+        for s in self.slots:
+            self._cancel_swapback(s)
         await asyncio.gather(*(self._kill_slot(s) for s in self.slots), return_exceptions=True)
         try:
             self.save_state()

@@ -49,7 +49,16 @@ python orchestrator.py
 | `ORCHESTRATOR_OWNER` | `orchestrator` | Owner name for models |
 | `ORCHESTRATOR_PORT` | `8010` | Listen port for the OpenAI-compatible endpoint |
 | `ORCHESTRATOR_QUEUE_TIMEOUT` | `300` | Queue timeout in seconds |
+| `ORCHESTRATOR_SWAP_CONGESTION_THRESHOLD` | `2` | Number of active + queued requests for a model on already-loaded slots before an idle slot is swapped to that model. Lower = more aggressive dual-GPU loading; higher = less churn. |
+| `ORCHESTRATOR_IDLE_SWAPBACK_SECONDS` | `300` | Seconds a slot must be idle with a non-`default_boot` model before it is automatically swapped back to its boot-default model. Set to `0` to disable. |
 | `ORCHESTRATOR_HEALTH_LENIENT` | `""` | Set to `1`, `true`, or `yes` to treat any ready slot as "ok" |
+
+## Routing policy
+
+1. Route to a free slot that already hosts the requested model.
+2. If a matching slot is busy, batch requests onto it until `ORCHESTRATOR_SWAP_CONGESTION_THRESHOLD` requests are in flight/queued for that model; then swap an idle slot to the requested model.
+3. If every slot is busy, continuous-batch onto the least-busy matching slot, or queue a swap.
+4. When a slot becomes idle with a non-`default_boot` model, it is automatically swapped back to its boot default after `ORCHESTRATOR_IDLE_SWAPBACK_SECONDS` (default 300s).
 
 ## Registry Schema
 
