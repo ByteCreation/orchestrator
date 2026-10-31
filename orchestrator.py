@@ -423,9 +423,38 @@ class Orchestrator:
             slot.swapback_task.cancel()
             slot.swapback_task = None
 
+    def _reset_slot_flight_state(self, slot: Slot) -> None:
+        """Reset transient per-slot counters and clean queued swaps when (re)starting a slot.
+
+        Called under the slot lock. Any stale in-flight reservation or queued swap
+        from a previous process lifetime is cleared; waiting requesters get a fast
+        503 so they can retry on the freshly-started slot.
+        """
+        old_active = slot.active_requests
+        slot.active_requests = 0
+        drained = 0
+        while not slot.queue.empty():
+            try:
+                _model_id, event = slot.queue.get_nowait()
+                event.set()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        if old_active or drained:
+            logger.info(
+                "Reset slot %d flight state on (re)start: active_requests %d->0, notified %d queued swap(s)",
+                slot.index, old_active, drained,
+            )
+
     def _release_request(self, slot: Slot) -> None:
         """Decrement active_requests and schedule swap-back if the slot is now idle."""
-        slot.active_requests = max(0, slot.active_requests - 1)
+        if slot.active_requests <= 0:
+            logger.warning(
+                "Double-release detected on slot %d (active_requests already %d); ignoring",
+                slot.index, slot.active_requests,
+            )
+            return
+        slot.active_requests -= 1
         if slot.is_idle():
             self._schedule_swapback(slot)
         else:
@@ -492,7 +521,9 @@ class Orchestrator:
         slot.state = "init"
         slot.loaded_model = None
 
-    async def _start_model(self, slot: Slot, model_id: str) -> bool:
+    async def _start_model(
+        self, slot: Slot, model_id: str, reset_flight_state: bool = True
+    ) -> bool:
         meta = self.registry.get(model_id)
         if not meta:
             logger.error("Model %s not in registry", model_id)
@@ -507,9 +538,19 @@ class Orchestrator:
                 first, second = sorted([slot, self.slots[1 - slot.index]], key=lambda s: s.index)
                 async with first.lock:
                     async with second.lock:
+                        # A fresh (re)start from boot/admin/swapback means a new
+                        # process lifetime; clear any stale in-flight counter or
+                        # queued swap left by the previous load. Swap paths pass
+                        # reset_flight_state=False because they already hold the
+                        # reservation for the request being served.
+                        if reset_flight_state:
+                            self._reset_slot_flight_state(slot)
+                            self._reset_slot_flight_state(second)
                         ok = await self._start_model_locked(slot, model_id, meta)
             else:
                 async with slot.lock:
+                    if reset_flight_state:
+                        self._reset_slot_flight_state(slot)
                     ok = await self._start_model_locked(slot, model_id, meta)
         finally:
             slot.ready_event.set()
@@ -889,7 +930,8 @@ class Orchestrator:
         # Swap on the reserved idle slot outside the route lock so other
         # requests can be routed while llama-server loads.
         if swap:
-            ok = await self._start_model(chosen, model_id)
+            # The reservation for this request is already held; do not reset it.
+            ok = await self._start_model(chosen, model_id, reset_flight_state=False)
             if not ok:
                 self._release_request(chosen)
                 raise HTTPException(
@@ -942,7 +984,8 @@ class Orchestrator:
             slot.active_requests += 1
             slot.state = "loading"
             slot.loaded_model = None
-            ok = await self._start_model(slot, model_id)
+            # The reservation for this queued request is already held; do not reset it.
+            ok = await self._start_model(slot, model_id, reset_flight_state=False)
             if not ok:
                 logger.error("Queued swap of %s on slot %d failed", model_id, slot.index)
                 self._release_request(slot)
@@ -1152,7 +1195,15 @@ class Orchestrator:
             return await self._route_to_external(model_id, meta, request)
 
         slot = await self._ensure_model_loaded(model_id)
-        return await self._forward(slot, request)
+        try:
+            return await self._forward(slot, request)
+        except Exception:
+            # If _forward raised before its own finally/_release_request could run
+            # (e.g. while reading the request body or building the upstream request),
+            # release the reservation we just acquired so the slot does not stay
+            # permanently busy. _release_request is idempotent for double-releases.
+            self._release_request(slot)
+            raise
 
     async def handle_completions(self, request: Request) -> Response:
         return await self.handle_chat_completions(request)
@@ -1280,6 +1331,9 @@ class Orchestrator:
         logger.info("Shutdown complete")
 
     def save_state(self) -> None:
+        # Persist slot configuration, not live counters. active_requests and the
+        # per-slot queue are process-lifetime state; carrying them across a
+        # restart makes a stuck counter look legitimate.
         state = {
             "slots": [
                 {
@@ -1287,7 +1341,7 @@ class Orchestrator:
                     "gpu": s.gpu,
                     "loaded_model": s.loaded_model,
                     "state": s.state,
-                    "active_requests": s.active_requests,
+                    "active_requests": 0,
                 }
                 for s in self.slots
             ]
