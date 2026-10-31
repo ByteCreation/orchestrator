@@ -155,7 +155,7 @@ If `$ORCHESTRATOR_WARM_CACHE_SCRIPT` points at a Python script, the orchestrator
 3. If every slot is busy, continuous-batch onto the least-busy matching slot; if no slot hosts the model, queue a swap on the least-busy slot with `ORCHESTRATOR_QUEUE_TIMEOUT`.
 4. When a slot becomes idle with a non-`default_boot` model, it is automatically swapped back to its boot default after `ORCHESTRATOR_IDLE_SWAPBACK_SECONDS`.
 
-Slot selection and the `active_requests` reservation run under a single route lock, so two concurrent requests cannot both claim the same free slot.
+Slot selection and the `active_requests` reservation run under a single route lock, so two concurrent requests cannot both claim the same free slot. If a counter ever leaks (e.g. a client disconnects before cleanup), it is reset the next time the slot (re)starts a model; live counters are not persisted to `state.json`.
 
 ---
 
